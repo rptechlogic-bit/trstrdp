@@ -1,0 +1,107 @@
+name: Secure RDP via Tailscale
+
+on:
+  workflow_dispatch:
+
+# Run this workflow only on a Windows machine you own/control that is registered
+# as a GitHub self-hosted runner. Do not use GitHub-hosted runners as a persistent VPS.
+jobs:
+  secure-rdp:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Configure RDP securely
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Enable Remote Desktop while keeping Network Level Authentication enabled.
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0 -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1 -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' -Value 2 -Force
+
+          # Enable the built-in Remote Desktop firewall rules.
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+          # Ensure the service is running; avoid force-restarting an active session.
+          Set-Service -Name TermService -StartupType Manual
+          Start-Service -Name TermService
+
+          Get-Service -Name TermService | Format-Table -AutoSize
+
+      - name: Install or update Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installerPath = Join-Path $env:TEMP 'tailscale-setup.msi'
+          $tsUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          try {
+            Start-Process -FilePath 'msiexec.exe' `
+              -ArgumentList @('/i', "`"$installerPath`"", '/quiet', '/norestart') `
+              -Wait -NoNewWindow
+            if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale installer returned exit code $LASTEXITCODE"
+            }
+          }
+          finally {
+            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw 'Add TAILSCALE_AUTH_KEY as a GitHub Actions secret.'
+          }
+
+          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (-not (Test-Path $tsExe)) {
+            throw "Tailscale executable not found at $tsExe"
+          }
+
+          & $tsExe up "--authkey=$env:TAILSCALE_AUTH_KEY" --hostname="windows-rdp-$env:COMPUTERNAME"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale up failed with exit code $LASTEXITCODE"
+          }
+
+          $tsIP = (& $tsExe ip -4 | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($tsIP)) {
+            throw 'Tailscale did not assign an IPv4 address.'
+          }
+
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tailscale IPv4: $tsIP"
+
+      - name: Verify RDP listener and local TCP port
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $listener = Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue
+          if (-not $listener) {
+            throw 'No RDP listener detected on TCP port 3389. Check Windows edition and RDP settings.'
+          }
+
+          $test = Test-NetConnection -ComputerName '127.0.0.1' -Port 3389 -WarningAction SilentlyContinue
+          if (-not $test.TcpTestSucceeded) {
+            throw 'Local TCP test to port 3389 failed.'
+          }
+
+          Write-Host "RDP listener is active. Connect from an authorized device on your tailnet to $env:TAILSCALE_IP`:3389"
